@@ -28,7 +28,7 @@ GROQ_MODEL_NAME=llama-3.3-70b-versatile
 CONFIDENCE_THRESHOLD=0.6
 ```
 
-### 3. Run
+### 3. Run Pipeline (CLI)
 
 ```bash
 python extract_geotech.py "Lab Results-Geotechnical-Factual-Report (1).pdf"
@@ -37,6 +37,13 @@ python extract_geotech.py "Lab Results-Geotechnical-Factual-Report (1).pdf"
 Output files are saved to `./output/`:
 - `extracted_results.csv`
 - `extracted_results.json`
+
+### 4. Run Dashboard (Web UI)
+
+```bash
+streamlit run app.py
+```
+This will open a web browser where you can upload PDF reports and download extracted data interactively.
 
 ### CLI Options
 

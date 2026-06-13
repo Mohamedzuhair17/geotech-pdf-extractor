@@ -153,17 +153,38 @@ def validate_percentage(value: str, field_name: str) -> str:
 # COMPONENT 2 — Page Classifier
 # ===========================================================================
 
-# Keyword sets for classifying pages by test type
+# Keyword sets for classifying pages by test type (synonym-expanded)
 TEST_KEYWORDS = {
-    "psd": ["particle size distribution", "sieve", "passed %"],
-    "atterberg": ["atterberg limit", "liquid limit", "plastic limit"],
-    "linear_shrinkage": ["linear shrinkage"],
+    "psd": [
+        "particle size distribution", "sieve", "passed %",
+        "grain size", "gradation", "grading", "sieve analysis",
+        "grain size distribution", "psd", "mechanical analysis",
+        "wet sieving", "dry sieving", "hydrometer",
+    ],
+    "atterberg": [
+        "atterberg limit", "liquid limit", "plastic limit",
+        "atterberg", "consistency limit", "plasticity",
+        "ll (%", "pl (%", "ll(%", "pl(%",
+    ],
+    "linear_shrinkage": [
+        "linear shrinkage", "lin. shrinkage", "lin shrinkage",
+        "shrinkage limit", "ls (%",
+    ],
     "cbr": ["california bearing ratio", "cbr"],
-    "moisture": ["moisture content"],
-    "ucs": ["uniaxial compressive strength"],
-    "emerson": ["emerson class"],
-    "pinhole": ["pinhole"],
-    "aggressivity": ["soil aggressivity", "chloride", "sulphate"],
+    "moisture": [
+        "moisture content", "water content", "natural moisture",
+        "w (%", "w(%", "mc (%",
+    ],
+    "ucs": [
+        "uniaxial compressive strength", "unconfined compressive",
+        "ucs", "qu (",
+    ],
+    "emerson": ["emerson class", "emerson"],
+    "pinhole": ["pinhole", "pin hole"],
+    "aggressivity": [
+        "soil aggressivity", "chloride", "sulphate", "sulfate",
+        "ph value", "resistivity",
+    ],
 }
 
 
@@ -196,45 +217,71 @@ def extract_metadata(text: str) -> dict:
         return meta
 
     # --- Sample Number ---
-    # Matches patterns like: GU-3498A, NC-4562C, BH01, etc.
-    m = re.search(
-        r"Sample\s*Number\s*[:\s]*([A-Z]{2,4}[-]?\d+[A-Z]*)",
-        text, re.I
-    )
-    if m:
-        meta["sample_number"] = m.group(1).strip()
+    # Matches patterns like: GU-3498A, NC-4562C, BH01, S-1, etc.
+    # Synonym headers: "Sample Number", "Sample No", "Sample ID", "Lab No", "Specimen No"
+    for sn_pattern in [
+        r"(?:Sample\s*(?:Number|No\.?|ID|Ref)|Lab(?:oratory)?\s*(?:No\.?|Number|Ref)|Specimen\s*(?:No\.?|Number|ID))\s*[:\s]*([A-Z]{2,4}[-]?\d+[A-Z]*)",
+    ]:
+        m = re.search(sn_pattern, text, re.I)
+        if m:
+            meta["sample_number"] = m.group(1).strip()
+            break
 
     # --- Location / Bore ID ---
-    # Look for "Sample Location" field in UCS-style tables first
-    m = re.search(r"Sample\s*Location\s*[:\s]*(Bore\s*\d+|BH\s*[-]?\d+)", text, re.I)
-    if m:
-        meta["location"] = normalize_location(m.group(1))
-    else:
-        # Try "Test Location" or standalone "Bore X" references
-        m = re.search(r"(?:Test\s*Location|Bore(?:hole)?)\s*[:\s]*(\d+)", text, re.I)
+    # Synonym headers: "Sample Location", "Test Location", "Bore", "Borehole",
+    #                  "Location", "Hole No", "Drill Hole", "Test Pit", "TP"
+    location_patterns = [
+        r"(?:Sample|Test)\s*Location\s*[:\s]*(Bore\s*\d+|BH\s*[-]?\d+)",
+        r"(?:Bore(?:hole)?|Hole|Drill\s*Hole)\s*(?:No\.?|Number|ID)?\s*[:\s]*(\d+)",
+        r"(?:Test\s*Pit|TP)\s*(?:No\.?)?\s*[:\s]*(\d+)",
+        r"Location\s*(?:ID|No\.?)?\s*[:\s]*(BH\s*[-]?\d+|TP\s*[-]?\d+)",
+    ]
+    for loc_pat in location_patterns:
+        m = re.search(loc_pat, text, re.I)
         if m:
-            meta["location"] = f"BH{m.group(1)}"
+            loc_val = m.group(1).strip()
+            # If only a number was captured, prefix with BH
+            if loc_val.isdigit():
+                loc_val = f"BH{loc_val}"
+            meta["location"] = normalize_location(loc_val)
+            break
 
     # --- Depth ---
-    # "Depth (m)" or "Depth:" followed by a range like "2.5-3.0" or "2.5 - 3.0"
-    m = re.search(
-        r"Depth\s*(?:\(m\))?\s*[:\s]*([\d.]+\s*[-\u2013]\s*[\d.]+)",
-        text, re.I
-    )
-    if m:
-        meta["depth"] = normalize_depth(m.group(1))
+    # Synonym headers: "Depth (m)", "Depth", "Sample Depth", "Depth Range",
+    #                  "Depth Below Surface", "Depth (mbgl)"
+    depth_patterns = [
+        r"(?:Sample\s*)?Depth\s*(?:Range)?\s*(?:\(m(?:bgl)?\))?\s*[:\s]*([\d.]+\s*[-\u2013]\s*[\d.]+)",
+        r"Depth\s*(?:Below\s*(?:Surface|Ground))?\s*(?:\(m\))?\s*[:\s]*([\d.]+\s*[-\u2013]\s*[\d.]+)",
+        r"Depth\s*(?:\(m\))?\s*[:\s]*([\d.]+)\s*m?\b",
+    ]
+    for d_pat in depth_patterns:
+        m = re.search(d_pat, text, re.I)
+        if m:
+            meta["depth"] = normalize_depth(m.group(1))
+            break
 
-    # --- Soil Description (from Emerson tables or descriptions) ---
-    m = re.search(r"Soil\s*Description\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)", text, re.I)
-    if m:
-        desc = m.group(1).strip()
-        if len(desc) > 2:
-            meta["soil_description"] = normalize_soil_description(desc)
+    # --- Soil Description ---
+    # Synonym headers: "Soil Description", "Material Description", "Soil Type",
+    #                  "Description of Sample", "Visual Classification", "Sample Description"
+    for desc_pattern in [
+        r"(?:Soil|Material|Sample)\s*(?:Description|Type|Classification)\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)",
+        r"Description\s*(?:of\s*(?:Sample|Soil|Material))\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)",
+        r"Visual\s*(?:Classification|Description)\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)",
+    ]:
+        m = re.search(desc_pattern, text, re.I)
+        if m:
+            desc = m.group(1).strip()
+            if len(desc) > 2:
+                meta["soil_description"] = normalize_soil_description(desc)
+                break
 
     # --- Geological Unit ---
+    # Synonym headers: "Geological Unit", "Geological Formation", "Stratigraphy",
+    #                  "Geology", "Formation", "Stratum"
     for pattern in [
-        r"Geological\s*(?:Unit|Formation)\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)",
-        r"(?:Alluvium|Tamala\s*Sand|Residual\s*Soil|Fill|Colluvium|Basalt)",
+        r"(?:Geological|Geo\.?)\s*(?:Unit|Formation|Stratum)\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)",
+        r"(?:Stratigraphy|Formation|Stratum|Geology)\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)",
+        r"(?:Alluvium|Tamala\s*Sand|Residual\s*Soil|Fill|Colluvium|Basalt|Laterite|Saprolite|Shale|Sandstone|Limestone|Claystone|Siltstone|Mudstone)",
     ]:
         m = re.search(pattern, text, re.I)
         if m:
@@ -265,9 +312,17 @@ def extract_psd(tables: list) -> dict:
     for table in tables:
         if not table:
             continue
-        # Identify PSD table by looking for "Sieve" or "Passed %" in first rows
+        # Identify PSD table by looking for sieve/grading synonyms in first rows
+        # Synonyms: "Sieve", "Passed %", "Passing %", "Percent Passing",
+        #           "% Finer", "Grain Size", "Aperture", "Cumulative"
         header_text = " ".join(str(cell) for row in table[:2] for cell in row if cell)
-        if "sieve" not in header_text.lower() and "passed" not in header_text.lower():
+        header_lower = header_text.lower()
+        psd_header_synonyms = [
+            "sieve", "passed", "passing", "percent passing",
+            "% finer", "finer", "grain size", "aperture",
+            "cumulative", "retained", "gradation",
+        ]
+        if not any(syn in header_lower for syn in psd_header_synonyms):
             continue
 
         # Parse sieve data into {sieve_mm: passing_%}
@@ -344,9 +399,68 @@ def extract_psd(tables: list) -> dict:
 # COMPONENT 5 — Atterberg & Linear Shrinkage Extractor
 # ===========================================================================
 
+# Synonym sets for Atterberg / Linear Shrinkage labels
+# Each tuple: (target_key, list_of_long_synonyms, list_of_short_synonyms)
+# Long synonyms use substring matching; short synonyms use word-boundary regex
+# to avoid false positives (e.g. "pl" matching inside "sample").
+ATTERBERG_SYNONYMS = [
+    ("ll", {
+        "long": ["liquid limit", "liq. limit", "liq limit", "liq lim", "liquidlimit"],
+        "short": [r"\bll\b", r"\bwl\b", r"\bw_l\b"],
+    }),
+    ("pl", {
+        "long": ["plastic limit", "plas. limit", "plas limit", "plas lim", "plasticlimit"],
+        "short": [r"\bpl\b", r"\bwp\b", r"\bw_p\b"],
+    }),
+    ("ls", {
+        "long": ["linear shrinkage", "lin. shrinkage", "lin shrinkage", "lin shrink", "linearshrinkage"],
+        "short": [r"\bls\b"],
+    }),
+    ("pi", {
+        "long": ["plasticity index", "plas. index", "plas index", "plasticityindex"],
+        "short": [r"\bpi\b", r"\bip\b"],
+    }),
+]
+
+
+def _match_atterberg_label(label: str) -> str:
+    """Match a row label against Atterberg synonym sets. Returns field key or ''.
+
+    Uses substring matching for long descriptive synonyms and word-boundary
+    regex for short abbreviations (<=3 chars) to avoid false positives.
+    """
+    label_clean = label.lower().strip()
+    for field_key, syn_dict in ATTERBERG_SYNONYMS:
+        # Check long synonyms via substring
+        for syn in syn_dict["long"]:
+            if syn in label_clean:
+                return field_key
+        # Check short synonyms via word-boundary regex
+        for pattern in syn_dict["short"]:
+            if re.search(pattern, label_clean, re.I):
+                return field_key
+    return ""
+
+
+def _is_numeric_value(value: str) -> bool:
+    """Check if a value string looks like a number (allows 'Non Plastic' etc.)."""
+    if not value or value == "-":
+        return False
+    # Accept "Non Plastic", "NP" as valid Atterberg results
+    if value.lower() in ("non plastic", "np", "non-plastic"):
+        return True
+    try:
+        float(value.replace(",", ""))
+        return True
+    except ValueError:
+        return False
+
+
 def extract_atterberg(tables: list) -> dict:
     """
     Extract Atterberg Limits and Linear Shrinkage from page tables.
+    Uses synonym-expanded label matching to handle different lab formats.
+    Only accepts values that look numeric (rejects 'Oven Dried', etc.).
     Returns: {ll, pl, pi, ls}
     """
     result = {"ll": "-", "pl": "-", "pi": "-", "ls": "-"}
@@ -360,12 +474,9 @@ def extract_atterberg(tables: list) -> dict:
             label = str(row[0]).strip().lower() if row[0] else ""
             value = str(row[1]).strip() if row[1] else ""
 
-            if "liquid limit" in label and "%" in label:
-                result["ll"] = normalize_numeric(value)
-            elif "plastic limit" in label and "%" in label:
-                result["pl"] = normalize_numeric(value)
-            elif "linear shrinkage" in label and "%" in label:
-                result["ls"] = normalize_numeric(value)
+            matched_key = _match_atterberg_label(label)
+            if matched_key and result[matched_key] == "-" and _is_numeric_value(value):
+                result[matched_key] = normalize_numeric(value)
 
     # Compute PI = LL - PL if both are numeric
     if result["ll"] != "-" and result["pl"] != "-":
@@ -653,12 +764,19 @@ def process_pdf(pdf_path: str) -> list:
                         rec[key] = validate_percentage(att[key], key)
 
             # --- Try extracting soil description from Emerson tables ---
+            # Synonym labels: "Soil Description", "Material", "Description",
+            #                 "Sample Description", "Soil Type"
             if "emerson" in test_types:
+                desc_synonyms = [
+                    "soil description", "material description",
+                    "sample description", "description of",
+                    "soil type", "material type", "visual classification",
+                ]
                 for table in tables:
                     for row in (table or []):
                         if row and len(row) >= 2:
                             label = str(row[0]).strip().lower() if row[0] else ""
-                            if "soil description" in label:
+                            if any(syn in label for syn in desc_synonyms):
                                 desc = normalize_soil_description(str(row[1]))
                                 if desc != "-" and rec["soil_description"] == "-":
                                     rec["soil_description"] = desc
