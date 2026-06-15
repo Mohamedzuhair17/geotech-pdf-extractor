@@ -120,10 +120,19 @@ def normalize_location(value) -> str:
 
 
 def normalize_soil_description(value) -> str:
-    """Clean soil description text to title case."""
+    """Clean soil description text to title case, preserving USCS symbols."""
     value = normalize_text(value)
     if value == "-":
         return "-"
+    # FIX: Preserve group symbols in uppercase (e.g., "(CL)", "(ML)", "(CH)")
+    # Only apply title case to non-symbol parts
+    if "(" in value and ")" in value:
+        # Has a group symbol - preserve it
+        match = re.search(r"^(.*?)\s*(\([A-Z]{2}(?:-[A-Z]{2})?\))$", value)
+        if match:
+            desc_part = match.group(1).title()
+            symbol_part = match.group(2)
+            return f"{desc_part} {symbol_part}"
     return value.title()
 
 
@@ -263,17 +272,33 @@ def extract_metadata(text: str) -> dict:
     # --- Soil Description ---
     # Synonym headers: "Soil Description", "Material Description", "Soil Type",
     #                  "Description of Sample", "Visual Classification", "Sample Description"
-    for desc_pattern in [
-        r"(?:Soil|Material|Sample)\s*(?:Description|Type|Classification)\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)",
-        r"Description\s*(?:of\s*(?:Sample|Soil|Material))\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)",
-        r"Visual\s*(?:Classification|Description)\s*[:\s]*([A-Za-z\s]+?)(?:\n|$)",
-    ]:
-        m = re.search(desc_pattern, text, re.I)
-        if m:
-            desc = m.group(1).strip()
-            if len(desc) > 2:
-                meta["soil_description"] = normalize_soil_description(desc)
-                break
+    # FIX: Capture multi-line descriptions where text spans lines (e.g., "Red Brown Sandy" / "Clay")
+    # Direct approach: match "Soil Description" followed by text, possibly with continuation on next line
+    m = re.search(r"Soil\s+Description\s+([A-Za-z\s()-]+?)(?:\n\s*([A-Za-z\s()-]+?))?(?:\n|$)", text, re.I)
+    if m:
+        desc = m.group(1).strip()
+        # If there's text on the next line and current desc is incomplete, append it
+        if m.group(2):
+            continuation = m.group(2).strip()
+            # Only append if it looks like a word, not a header/section
+            if re.match(r'^[A-Z][a-z]', continuation) and len(continuation) > 2 and ':' not in continuation:
+                desc = f"{desc} {continuation}".strip()
+        meta["soil_description"] = normalize_soil_description(desc)
+    else:
+        # Fallback patterns: "Material:" (with colon) or other description fields
+        # FIX: Require colon after "Material" to avoid matching "Material Test Report" header
+        for pattern in [
+            r"Material\s*:\s*([A-Za-z\s()-]+?)(?:\n|$)",
+            r"(?:Soil|Sample)\s*(?:Description|Type|Classification)\s*[:\s]*([A-Za-z\s()-]+?)(?:\n|$)",
+            r"Description\s*(?:of\s*(?:Sample|Soil|Material))\s*[:\s]*([A-Za-z\s()-]+?)(?:\n|$)",
+            r"Visual\s*(?:Classification|Description)\s*[:\s]*([A-Za-z\s()-]+?)(?:\n|$)",
+        ]:
+            m = re.search(pattern, text, re.I | re.MULTILINE)
+            if m:
+                desc = m.group(1).strip()
+                if len(desc) > 2:
+                    meta["soil_description"] = normalize_soil_description(desc)
+                    break
 
     # --- Geological Unit ---
     # Synonym headers: "Geological Unit", "Geological Formation", "Stratigraphy",
@@ -333,7 +358,8 @@ def extract_psd(tables: list) -> dict:
             sieve_str = str(row[0]).strip() if row[0] else ""
             passed_str = str(row[1]).strip() if row[1] else ""
 
-            # Extract sieve size in mm from strings like "0.075 mm", "4.75 mm", "19 mm"
+            # Extract sieve size in mm from strings like "0.075 mm", "4.75mm", "19 mm"
+            # FIX: Enhanced regex to handle optional spaces and more sieve formats
             sieve_match = re.match(r"([\d.]+)\s*mm", sieve_str, re.I)
             if not sieve_match:
                 continue
@@ -374,6 +400,12 @@ def extract_psd(tables: list) -> dict:
             result["pct_sand"] = normalize_numeric(str(round(sand_pct, 1)))
         elif sand_475 is not None:
             result["pct_sand"] = normalize_numeric(str(sand_475))
+        elif fines_075 is not None:
+            # INFERENCE: If we only have fines but no sand/gravel boundary, infer sand = 100-fines, gravel = 0
+            # This handles cases where PSD table only reports 0.075mm sieve without coarser boundaries
+            sand_pct = 100.0 - fines_075
+            result["pct_sand"] = normalize_numeric(str(round(sand_pct, 1)))
+            result["pct_gravel"] = "0"
 
         if sand_475 is not None:
             gravel_pct = 100.0 - sand_475
@@ -523,21 +555,35 @@ def compute_confidence(row: dict) -> float:
                 pass
     numeric_score = valid_count / numeric_count if numeric_count > 0 else 0.0
 
-    # 3. PSD consistency (20%)
+    # 3. PSD consistency (20%) - FIX: Handle partial PSD data correctly
+    # Count how many PSD fields are present (not "-")
+    psd_fields_present = sum(1 for k in ["pct_fines", "pct_sand", "pct_gravel"] if row.get(k, "-") != "-")
     psd_score = 0.0
-    try:
-        f = float(row.get("pct_fines", "-"))
-        s = float(row.get("pct_sand", "-"))
-        g = float(row.get("pct_gravel", "-"))
-        total = f + s + g
-        if abs(total - 100) <= 2:
-            psd_score = 1.0
-        elif abs(total - 100) <= 10:
-            psd_score = 0.5
-        else:
-            psd_score = 0.2
-    except (ValueError, TypeError):
-        psd_score = 0.0
+    
+    if psd_fields_present > 0:
+        try:
+            psd_values = []
+            for k in ["pct_fines", "pct_sand", "pct_gravel"]:
+                val = row.get(k, "-")
+                if val != "-":
+                    psd_values.append(float(val))
+            
+            if psd_values:
+                total = sum(psd_values)
+                # Score based on how close to 100% the present fields sum to
+                if abs(total - 100) <= 2:
+                    psd_score = 1.0
+                elif abs(total - 100) <= 10:
+                    psd_score = 0.7  # Partial but reasonable
+                elif psd_fields_present == 3 and abs(total - 100) <= 15:
+                    psd_score = 0.4  # All fields present but off
+                else:
+                    psd_score = 0.3
+        except (ValueError, TypeError):
+            psd_score = 0.0
+    else:
+        # No PSD data present; score neutral (not penalized)
+        psd_score = 0.5
 
     # 4. Metadata quality (20%)
     meta_filled = sum(1 for f in METADATA_FIELDS if row.get(f, "-") != "-")
@@ -763,23 +809,31 @@ def process_pdf(pdf_path: str) -> list:
                     if rec[key] == "-" and att[key] != "-":
                         rec[key] = validate_percentage(att[key], key)
 
-            # --- Try extracting soil description from Emerson tables ---
-            # Synonym labels: "Soil Description", "Material", "Description",
-            #                 "Sample Description", "Soil Type"
-            if "emerson" in test_types:
-                desc_synonyms = [
-                    "soil description", "material description",
-                    "sample description", "description of",
-                    "soil type", "material type", "visual classification",
-                ]
+            # --- Try extracting soil description from any test table (not just Emerson) ---
+            # FIX: Expanded search from "emerson" test pages to ALL test pages with tables
+            # Soil descriptions often appear in PSD, Atterberg, CBR, and Emerson test tables
+            desc_synonyms = [
+                "soil description", "material description", "material",
+                "sample description", "description of", "soil type", 
+                "material type", "visual classification", "description",
+                "soil name", "sample name", "classification",
+            ]
+            # First try to find description in table rows if not already captured from header
+            if rec["soil_description"] == "-":
                 for table in tables:
                     for row in (table or []):
                         if row and len(row) >= 2:
                             label = str(row[0]).strip().lower() if row[0] else ""
-                            if any(syn in label for syn in desc_synonyms):
-                                desc = normalize_soil_description(str(row[1]))
-                                if desc != "-" and rec["soil_description"] == "-":
+                            value = str(row[1]).strip() if row[1] else ""
+                            # Check if this row is a soil description row
+                            if any(syn in label for syn in desc_synonyms) and value and value != "-":
+                                desc = normalize_soil_description(value)
+                                if desc != "-":
                                     rec["soil_description"] = desc
+                                    logger.debug(f"  Page {page_num}: Extracted description from table: {desc}")
+                                    break
+                    if rec["soil_description"] != "-":
+                        break
 
             # --- Try to extract location from pinhole test (multi-bore tables) ---
             if "pinhole" in test_types:
@@ -815,11 +869,24 @@ def process_pdf(pdf_path: str) -> list:
                 f"  {sample_id}: confidence={confidence} (below 0.8, above threshold)"
             )
         else:
+            # FIX: Check if we have valid PSD data before triggering LLM fallback
+            # If PSD sums to ~100, don't trigger LLM even if other fields are missing
+            psd_valid = False
+            try:
+                psd_fields = [float(row.get(k, "-")) for k in ["pct_fines", "pct_sand", "pct_gravel"] if row.get(k, "-") != "-"]
+                if psd_fields and len(psd_fields) >= 2:  # At least 2 of 3 PSD fields
+                    psd_total = sum(psd_fields)
+                    if abs(psd_total - 100) <= 5:  # Within 5% of 100
+                        psd_valid = True
+            except (ValueError, TypeError):
+                pass
+            
             # Trigger LLM fallback
             logger.warning(
                 f"  {sample_id}: confidence={confidence} (below threshold={CONFIDENCE_THRESHOLD})"
             )
-            if groq.is_available() and rec.get("raw_page_texts"):
+            if groq.is_available() and rec.get("raw_page_texts") and not psd_valid:
+                # Only use LLM if PSD is invalid/missing
                 combined_text = "\n\n---PAGE BREAK---\n\n".join(rec["raw_page_texts"])
                 llm_result = groq.extract_from_text(combined_text, sample_id)
                 if llm_result:
